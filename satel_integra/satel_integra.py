@@ -137,6 +137,7 @@ class AsyncSatel:
         self._alarm_status_callback = None
         self._zone_changed_callback = None
         self._output_changed_callback = None
+        self._temperature_received_callback = None
         self._partitions = partitions
         self._command_status_event = asyncio.Event()
         self._command_status = False
@@ -165,6 +166,7 @@ class AsyncSatel:
             AlarmState.TRIGGERED, msg)
         self._message_handlers[b'\x14'] = lambda msg: self._armed(
             AlarmState.TRIGGERED_FIRE, msg)
+        self._message_handlers[b'\x7D'] = self._zone_temperature_received
         self._encryption_handler = None
 
     @property
@@ -225,6 +227,26 @@ class AsyncSatel:
             self._zone_changed_callback(status)
 
         return status
+
+    def _zone_temperature_received(self, msg):
+        """0x7D   read zone temperature
+              + 1 bytes - zone number
+              + 3 bytes = temperature (float, 0x0000 = -55 degrees Celsius)
+           Calculation formula provided by github.com/lukaszspaczynski"""
+
+        zone_id = msg[1]
+        if msg[-2:] != b'\xFF\xFF':
+            temperature = (int.from_bytes(msg[-2:], byteorder='big', signed=True) * 0.5) - 55.0
+            _LOGGER.debug("Received temperature for zone #%s: %s", zone_id, temperature)
+            status = {}
+            status[zone_id] = temperature
+            _LOGGER.debug("Returning status: %s", status)
+            if self._temperature_received_callback:
+                self._temperature_received_callback(status)
+            return status
+        else:
+            _LOGGER.error("Zone %s does not provide temperature data.", zone_id)
+            return False
 
     def _output_changed(self, msg):
         """0x17   outputs state 0x17   + 16/32 bytes"""
@@ -334,6 +356,16 @@ class AsyncSatel:
         data = generate_query(b'\x85' + code_bytes
                               + partition_bytes(partition_list))
 
+        await self._send_data(data)
+
+    async def read_temperature(self, zone_id):
+        """Send temperature read command to the alarm."""
+        """0x7D   read zone temperature
+              + 1 bytes - zone number
+              If function is accepted, function result can be
+              checked by observe the system state """
+        _LOGGER.debug("Reading zone temperature, zone: %s", zone_id)
+        data = generate_query(b'\x7d' + zone_id.to_bytes(1, 'big'))
         await self._send_data(data)
 
     async def set_output(self, code, output_id, state):
@@ -446,7 +478,8 @@ class AsyncSatel:
 
     async def monitor_status(self, alarm_status_callback=None,
                              zone_changed_callback=None,
-                             output_changed_callback=None):
+                             output_changed_callback=None,
+                             temperature_received_callback=None):
         """Start monitoring of the alarm status.
 
         Send command to satel integra to start sending updates. Read in a
@@ -455,6 +488,7 @@ class AsyncSatel:
         self._alarm_status_callback = alarm_status_callback
         self._zone_changed_callback = zone_changed_callback
         self._output_changed_callback = output_changed_callback
+        self._temperature_received_callback = temperature_received_callback
 
         _LOGGER.info("Starting monitor_status loop")
 
@@ -503,7 +537,7 @@ def demo(host, port, integration_key=''):
                      )
 
     loop.run_until_complete(stl.connect())
-    loop.create_task(stl.arm("3333", (1,)))
+    loop.run_until_complete(stl.read_temperature(17))
     loop.create_task(stl.disarm("3333",(1,)))
     loop.create_task(stl.keep_alive())
     loop.create_task(stl.monitor_status())
